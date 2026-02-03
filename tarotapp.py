@@ -7,6 +7,8 @@ import os
 import uuid
 from PIL import Image
 import google.generativeai as genai
+import google.generativeai as genai # 혹시 모르니 남겨둬도 됨
+from mistralai import Mistral  # [추가] 미스트랄 라이브러리
 
 # --- 데이터 로드 ---
 try:
@@ -152,6 +154,7 @@ if 'api_key_input' not in st.session_state: st.session_state.api_key_input = ""
 if 'is_shuffling' not in st.session_state: st.session_state.is_shuffling = False
 if 'shuffle_count' not in st.session_state: st.session_state.shuffle_count = 1 
 if 'pending_ai_idx' not in st.session_state: st.session_state.pending_ai_idx = None
+if 'last_api_time' not in st.session_state: st.session_state.last_api_time = 0
 # [수정] run_id는 초기화만 하고, 실행 버튼 누를 때만 갱신 (카드 사라짐 방지)
 if 'run_id' not in st.session_state: st.session_state.run_id = str(uuid.uuid4())
 
@@ -185,16 +188,24 @@ def flip_card_callback(index):
 
 # --- AI 처리 ---
 def process_pending_ai():
+    # 1. 대기열 확인
     if st.session_state.pending_ai_idx is None: return
     
     idx = st.session_state.pending_ai_idx
-    st.session_state.pending_ai_idx = None # 즉시 큐 비우기 (중복 실행 방지)
+    st.session_state.pending_ai_idx = None 
     
+    # 2. 이미 분석된 카드면 패스
     if st.session_state.cards[idx].get('ai_done', False): return
 
+    # API 키 확인
     api_key = st.session_state.api_key_input
-    if not api_key: return
+    provider = st.session_state.get("ai_provider", "Mistral") # 기본값 Mistral
 
+    if not api_key: 
+        add_log(f"{provider} API Key가 없어. 사이드바 확인해.", "system")
+        return
+
+    # --- 공통 데이터 준비 ---
     card = st.session_state.cards[idx]
     count = len(st.session_state.cards)
     question = st.session_state.get('question', '')
@@ -212,27 +223,51 @@ def process_pending_ai():
     orientation = "정방향" if is_up else "역방향"
     meaning = card_data['meaning_up'] if is_up else card_data['meaning_rev']
 
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        
-        prompt = (
-            f"당신은 사이버펑크 타로 리더입니다. (반말, 냉철함, Cyberpunk 2077의 Jhonny Silverhand 같은 인격)\n"
-            f"질문: {question}\n"
-            f"현재 카드: {pos_name} - {card_data['name']} ({orientation})\n"
-            f"기본 의미: {meaning}\n"
-            f"미션: 이 카드가 '{pos_name}' 관점에서 질문에 갖는 의미를 1~2문장으로 타격감 있게 해석해."
-        )
-        if is_last:
-             prompt += "\n\n(추가 미션: 이게 마지막이다. 해석 후에 엔터 두 번 치고, '🛑 [절명시]' 라벨과 함께 전체 조언을 한 문장으로 요약해줘.)"
+    # --- 페르소나 설정 (공통) ---
+    persona = "네 역할은 사이버펑크 2077의 조니 실버핸드가 타로점을 본다는 설정이야. 말투는 반말, 시니컬하지만 욕설은 하지마."
+    user_query = (
+        f"질문: {question}\n"
+        f"카드: {pos_name} - {card_data['name']} ({orientation})\n"
+        f"의미: {meaning}\n"
+        f"지시: 이 카드가 '{pos_name}' 관점에서 질문자에게 갖는 의미를 1~2문장으로 강렬하게 해석해."
+    )
+    if is_last:
+        user_query += "\n(마지막 지시: 엔터 두 번 치고, '[절명시]' 라벨을 붙이고 전체 요약을 한 줄로 남겨.)"
 
-        response = model.generate_content(prompt)
-        add_log(f"[{pos_name}] 분석 결과:\n{response.text}", "ai")
+    try:
+        response_text = ""
+
+        # ================= [분기점] Mistral 선택 시 =================
+        if "Mistral" in provider:
+            client = Mistral(api_key=api_key)
+            chat_response = client.chat.complete(
+                model="mistral-small-latest", 
+                messages=[
+                    {"role": "system", "content": persona},
+                    {"role": "user", "content": user_query},
+                ]
+            )
+            response_text = chat_response.choices[0].message.content
+
+        # ================= [분기점] Gemini 선택 시 =================
+        else:
+            genai.configure(api_key=api_key)
+            # 현실적인 모델명 (404 방지용)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            
+            # Gemini는 시스템 프롬프트를 따로 설정하거나 합쳐서 보냄
+            full_prompt = f"{persona}\n\n{user_query}"
+            response = model.generate_content(full_prompt)
+            response_text = response.text
+
+        # --- 결과 처리 (공통) ---
+        add_log(f"[{pos_name}] 분석 결과:\n{response_text}", "ai")
         st.session_state.cards[idx]['ai_done'] = True
-        st.rerun() # 로그 업데이트
+        st.rerun()
 
     except Exception as e:
-        add_log(f"통신 오류: {e}", "system")
+        add_log(f"⚠ {provider} 통신 오류: {e}", "system")
+        st.rerun()
 
 # --- 영상 셔플 ---
 def animate_and_generate():
@@ -298,7 +333,7 @@ def start_execution():
     else: st.session_state.shuffle_count = 3
 
 # --- 렌더링 함수 (Fragment 제거) ---
-# @st.fragment  <-- 제거됨! 일반 함수로 전환하여 안정성 확보
+# 기존 render_single_card 함수를 이걸로 통째로 교체
 def render_single_card(index, label_txt, img_width, label_size, run_id, total_count):
     st.markdown(f"<div class='card-wrapper'>", unsafe_allow_html=True)
     st.markdown(f"<div class='pos-label' style='font-size:{label_size}'>{label_txt}</div>", unsafe_allow_html=True)
@@ -306,10 +341,14 @@ def render_single_card(index, label_txt, img_width, label_size, run_id, total_co
     card = st.session_state.cards[index]
     is_revealed = st.session_state.revealed[index]
     
+    # 분석 중일 때만 버튼 막기 (쿨타임 제거)
+    is_analyzing = st.session_state.pending_ai_idx is not None
+    
     back_src = card.get('back_src')
     if not back_src: back_src = get_b64_image("back") or get_b64_image("Fool")
     
     if is_revealed:
+        # === 앞면 (공개됨) ===
         real_src = card.get('front_src')
         if not real_src: real_src = get_b64_image(card['data']['image_key'], rotate=not card['is_up'])
             
@@ -326,35 +365,63 @@ def render_single_card(index, label_txt, img_width, label_size, run_id, total_co
             </div>
         """, unsafe_allow_html=True)
         
+        # [삭제됨] 재해석 버튼 로직 제거
+
     else:
+        # === 뒷면 (아직 안 뒤집음) ===
         st.markdown(f"<img src='{back_src}' width='{img_width}' class='card-img'>", unsafe_allow_html=True)
-        
         st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
         
+        # 버튼 렌더링
         if total_count == 10:
-            st.button("뒤집기", key=f"flip_{index}_{run_id}", on_click=flip_card_callback, args=(index,), use_container_width=True)
+            st.button("뒤집기", key=f"flip_{index}_{run_id}", on_click=flip_card_callback, args=(index,), use_container_width=True, disabled=is_analyzing)
         else:
             if total_count == 1:
                 c1, c2, c3 = st.columns([12, 4, 12], gap="small")
             else:
                 c1, c2, c3 = st.columns([3, 2, 3], gap="small")
             with c2:
-                st.button("뒤집기", key=f"flip_{index}_{run_id}", on_click=flip_card_callback, args=(index,), use_container_width=True)
+                st.button("뒤집기", key=f"flip_{index}_{run_id}", on_click=flip_card_callback, args=(index,), use_container_width=True, disabled=is_analyzing)
         
         st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# --- 사이드바 ---
+# --- 사이드바 (수정됨) ---
 with st.sidebar:
     st.title("⚙️ SETTINGS")
-    api_input = st.text_input("Gemini API Key", type="password", placeholder="여기에 키를 입력하세요", value=st.session_state.api_key_input)
+    
+    # [추가] AI 공급자 선택 기능
+    ai_provider = st.selectbox(
+        "AI Model Provider", 
+        ["Mistral AI (Recommended)", "Google Gemini"],
+        index=0
+    )
+    st.session_state.ai_provider = ai_provider
+
+    # 선택된 모델에 따라 라벨 바뀜
+    label_txt = "Mistral API Key" if "Mistral" in ai_provider else "Gemini API Key"
+    
+    api_input = st.text_input(label_txt, type="password", placeholder="키를 입력하세요", value=st.session_state.api_key_input)
+
+    # ▼▼▼ [버튼 추가 위치] ▼▼▼
+    # 미스트랄이 선택되었을 때만 가이드 버튼 노출
+    if "Mistral" in ai_provider:
+        st.link_button(
+            label="📘 무료 키 발급 가이드 보기", 
+            url="https://docs.google.com/presentation/d/1xTUWrusNROIonDWL5hEWpybNCqo2W8kYHr4czDPWnok/edit?slide=id.p#slide=id.p" # 👈 여기에 프레젠테이션 링크를 넣으세요!
+        )
+    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+    
     if st.button("🔌 시스템 연동 (CONNECT)"):
         st.session_state.api_key_input = api_input
         st.rerun()
-    if st.session_state.api_key_input: st.success("✅ Neural Link Active")
-    else: st.caption("⚠️ API Key Required")
+        
+    if st.session_state.api_key_input: 
+        st.success(f"✅ {ai_provider.split()[0]} Link Active")
+    else: 
+        st.caption("⚠️ API Key Required")
 
 # --- 메인 레이아웃 ---
 st.title("사이버펑크 식으로 타로점 보기")
